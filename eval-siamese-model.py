@@ -1,102 +1,173 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.metrics import roc_curve, auc
-
-# Import classes from your training script
-# (Make sure train_siamese_network.py is in the same folder)
-from train_siamese_network import SiameseNetwork, VidimuSiameseDataset
+from sklearn.manifold import TSNE
+from sklearn.metrics import roc_curve, auc, accuracy_score
+import torch.nn.functional as F
+import math
 
 # --- CONFIGURATION ---
-NPZ_FILE = "/mnt/dataset-augmentation/siamese_A01_augmented.npz"
-MODEL_PATH = "siamese_model.pth"
-BATCH_SIZE = 32
+NPZ_FILE = "dataset-augmentation/siamese_A01_augmented.npz"
+MODEL_PATH = "best-model.pth"
+BATCH_SIZE = 128
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# --- RE-DEFINE MODEL (Must match training script exactly) ---
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=500):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+    def forward(self, x):
+        return x + self.pe[:x.size(1), :]
+
+class SOTATransformerBranch(nn.Module):
+    def __init__(self, input_dim, model_dim=256, num_heads=8, num_layers=6, output_dim=128):
+        super().__init__()
+        
+        # Hardcoded dropout to match training config
+        dropout = 0.2 
+        
+        self.batch_norm = nn.BatchNorm1d(input_dim)
+        self.input_proj = nn.Linear(input_dim, model_dim)
+        self.pos_encoder = PositionalEncoding(model_dim)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim, 
+            nhead=num_heads, 
+            dim_feedforward=512, 
+            dropout=dropout, 
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # --- THE FIX IS HERE ---
+        # We added nn.Dropout(dropout) to match the training script
+        self.fc = nn.Sequential(
+            nn.Linear(model_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.GELU(),
+            nn.Dropout(dropout),       # <--- This layer was missing
+            nn.Linear(512, output_dim)
+        )
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.batch_norm(x)
+        x = x.permute(0, 2, 1)
+        
+        x = self.input_proj(x)
+        x = self.pos_encoder(x)
+        x = self.transformer(x)
+        
+        x = x.mean(dim=1)
+        
+        embedding = self.fc(x)
+        return F.normalize(embedding, p=2, dim=1)
+
+class CrossModalNetwork(nn.Module):
+    def __init__(self, video_dim, imu_dim):
+        super().__init__()
+        self.video_branch = SOTATransformerBranch(video_dim, output_dim=128)
+        self.imu_branch = SOTATransformerBranch(imu_dim, output_dim=128)
+    def forward(self, video_seq, imu_seq):
+        return self.video_branch(video_seq), self.imu_branch(imu_seq)
+
+def compute_derivatives(sequence):
+    if isinstance(sequence, np.ndarray): sequence = torch.from_numpy(sequence).float()
+    vel = torch.zeros_like(sequence); vel[1:] = sequence[1:] - sequence[:-1]
+    acc = torch.zeros_like(vel); acc[1:] = vel[1:] - vel[:-1]
+    return torch.cat([sequence, vel, acc], dim=1)
+
+# --- MAIN EVALUATION ---
 def evaluate():
-    print(f"Loading data from {NPZ_FILE}...")
-    dataset = VidimuSiameseDataset(NPZ_FILE)
+    print("Loading data and model...")
+    data = np.load(NPZ_FILE)
     
-    # Ideally, you should use a separate Test set. 
-    # For now, we will evaluate on the full dataset to see how well it learned.
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
+    # Use only a subset for visualization (too many points makes t-SNE messy)
+    # We take the first 1000 pairs
+    SUBSET_SIZE = 1000
+    vid_pairs = data['video_pairs'][:SUBSET_SIZE]
+    imu_pairs = data['imu_pairs'][:SUBSET_SIZE]
+    labels = data['labels'][:SUBSET_SIZE]
 
-    # Determine input dimensions from first sample
-    sample_video, sample_imu, _ = dataset[0]
-    video_dim = sample_video.shape[1]
-    imu_dim = sample_imu.shape[1]
+    # Process Features
+    proc_vid = torch.stack([compute_derivatives(v) for v in vid_pairs])
+    proc_imu = torch.stack([compute_derivatives(i) for i in imu_pairs])
+    labels = torch.from_numpy(labels)
 
-    # Load Model
-    print(f"Loading model from {MODEL_PATH}...")
-    model = SiameseNetwork(video_dim, imu_dim).to(DEVICE)
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+    # Initialize Model
+    model = CrossModalNetwork(proc_vid.shape[2], proc_imu.shape[2]).to(DEVICE)
+    model.load_state_dict(torch.load(MODEL_PATH))
     model.eval()
 
-    print("Running inference...")
-    
-    distances = []
-    labels = []
-
+    print("Running Inference...")
     with torch.no_grad():
-        for batch_video, batch_imu, batch_label in dataloader:
-            batch_video = batch_video.to(DEVICE)
-            batch_imu = batch_imu.to(DEVICE)
-            
-            # Get embeddings
-            video_emb, imu_emb = model(batch_video, batch_imu)
-            
-            # Calculate Euclidean distance
-            dist = nn.functional.pairwise_distance(video_emb, imu_emb)
-            
-            distances.extend(dist.cpu().numpy())
-            labels.extend(batch_label.cpu().numpy())
+        v_emb, i_emb = model(proc_vid.to(DEVICE), proc_imu.to(DEVICE))
+        
+        # Calculate Euclidean Distances
+        dists = F.pairwise_distance(v_emb, i_emb).cpu().numpy()
 
-    distances = np.array(distances)
-    labels = np.array(labels)
-
-    # --- ANALYSIS ---
-    
-    # Separate distances by label
-    pos_distances = distances[labels == 1]
-    neg_distances = distances[labels == 0]
-
-    print(f"\nAverage Distance (Positive Pairs): {np.mean(pos_distances):.4f} (Should be low)")
-    print(f"Average Distance (Negative Pairs): {np.mean(neg_distances):.4f} (Should be high)")
-
-    # --- PLOT HISTOGRAM ---
-    plt.figure(figsize=(10, 6))
-    plt.hist(pos_distances, bins=30, alpha=0.7, label='Positive (Same Person)', color='green')
-    plt.hist(neg_distances, bins=30, alpha=0.7, label='Negative (Diff Person)', color='red')
-    plt.title("Distribution of Distances for Positive vs Negative Pairs")
-    plt.xlabel("Euclidean Distance")
-    plt.ylabel("Count")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    save_path = "evaluation_histogram.png"
-    plt.savefig(save_path)
-    print(f"Histogram saved to {save_path}")
-    plt.show()
-
-    # --- CALCULATE ACCURACY ---
-    # We need to find a 'threshold' to decide if it's a match or not.
-    # A simple way is to check the ROC curve.
-    fpr, tpr, thresholds = roc_curve(labels, -distances) # Negative because lower dist = higher score
+    # --- METRIC 1: ROC CURVE ---
+    # Invert distances because ROC expects "Higher Score = Positive"
+    # Currently Dist 0 = Positive. So we use (2.0 - Distance) as the score.
+    scores = 2.0 - dists
+    fpr, tpr, thresholds = roc_curve(labels, scores)
     roc_auc = auc(fpr, tpr)
     
-    # Find the optimal threshold (closest to top-left corner of ROC)
-    optimal_idx = np.argmax(tpr - fpr)
-    optimal_threshold = -thresholds[optimal_idx]
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0]); plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate'); plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic')
+    plt.legend(loc="lower right")
+
+    # --- METRIC 2: t-SNE VISUALIZATION ---
+    print("Computing t-SNE (this takes a moment)...")
     
-    print(f"\nOptimal Distance Threshold: {optimal_threshold:.4f}")
+    # We want to plot ONLY the Positive pairs to see if Video and IMU align
+    pos_indices = np.where(labels == 1)[0]
     
-    # Compute accuracy at this threshold
-    predictions = (distances < optimal_threshold).astype(int)
-    accuracy = np.mean(predictions == labels)
-    print(f"Final Accuracy: {accuracy*100:.2f}%")
-    print(f"ROC AUC Score: {roc_auc:.4f}")
+    # We pick the first 50 positive pairs to plot (100 dots total)
+    # Ideally, Dot i (Video) should be close to Dot i (IMU)
+    limit = 50
+    subset_idx = pos_indices[:limit]
+    
+    v_emb_subset = v_emb.cpu().numpy()[subset_idx]
+    i_emb_subset = i_emb.cpu().numpy()[subset_idx]
+    
+    # Combine for t-SNE
+    combined = np.concatenate([v_emb_subset, i_emb_subset], axis=0)
+    tsne = TSNE(n_components=2, perplexity=10, random_state=42)
+    results = tsne.fit_transform(combined)
+    
+    v_tsne = results[:limit]
+    i_tsne = results[limit:]
+    
+    plt.subplot(1, 2, 2)
+    plt.title(f"t-SNE of {limit} Positive Pairs")
+    
+    # Plot dots
+    plt.scatter(v_tsne[:,0], v_tsne[:,1], c='blue', label='Video', alpha=0.6)
+    plt.scatter(i_tsne[:,0], i_tsne[:,1], c='red', label='IMU', alpha=0.6)
+    
+    # Draw lines connecting the pairs
+    for i in range(limit):
+        plt.plot([v_tsne[i,0], i_tsne[i,0]], [v_tsne[i,1], i_tsne[i,1]], 'k-', alpha=0.2)
+        
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("evaluation_plots.png")
+    print("Plots saved to evaluation_plots.png")
+    print(f"Final ROC-AUC Score: {roc_auc:.4f}")
 
 if __name__ == "__main__":
     evaluate()
