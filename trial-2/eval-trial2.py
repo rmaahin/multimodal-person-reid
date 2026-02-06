@@ -9,7 +9,7 @@ import math
 
 # --- CONFIGURATION ---
 NPZ_FILE = "/person-reid/multimodal-person-reid/dataset-augmentation/siamese_A01_augmented.npz"
-MODEL_PATH = "best_sota_model_v2.pth" # Ensure this is your V2 model file
+MODEL_PATH = "/mnt/multimodal-person-reid/trial-2/best_model_corrected_v2.pth"
 BATCH_SIZE = 128
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DROPOUT = 0.2 
@@ -166,8 +166,8 @@ def evaluate():
         
     plt.legend()
     plt.tight_layout()
-    plt.savefig("evaluation_plots_v2.png")
-    print("Plots saved to evaluation_plots_v2.png")
+    plt.savefig("/mnt/multimodal-person-reid/trial-2/evaluation_plots_v3.png")
+    print("Plots saved to evaluation_plots_v3.png")
     print(f"Final ROC-AUC Score: {roc_auc:.4f}")
 
 if __name__ == "__main__":

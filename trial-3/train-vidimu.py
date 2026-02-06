@@ -321,7 +321,7 @@ def train():
                 'auc': roc_auc,
                 'threshold': optimal_threshold,
                 'margin': MARGIN
-            }, "/mnt/multimodal-person-reid/trial-2/best_model_corrected_v2.pth")
+            }, "/mnt/multimodal-person-reid/trial-3/best_model_v3.pth")
             print(f"  ✅ New Best Model Saved! (AUC: {roc_auc:.4f})")
         
         # MEMORY OPTIMIZATION: Periodic cleanup
@@ -333,7 +333,7 @@ def train():
     print(f"\n🏆 Training Complete!")
     print(f"   Best AUC: {best_auc:.4f}")
     print(f"   Best Threshold: {best_threshold:.3f}")
-    print(f"   Model saved to: best_model_corrected_v2.pth")
+    print(f"   Model saved to: best_model_v3.pth")
 
 if __name__ == "__main__":
     train()
