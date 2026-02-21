@@ -1,0 +1,2 @@
+roc_auc,accuracy,precision,recall,f1_score,optimal_threshold,confusion_matrix,component_separations
+0.501105,52.0,0.5147275405007363,0.699,0.5928753180661578,0.6220874560743934,"[[341, 659], [301, 699]]","{'feature_cosine': 0.0003918543026905641, 'feature_euclidean': -2.1740657767384958e-05, 'spectral_cosine': -4.515778820957106e-05, 'spectral_euclidean': -0.0011779628186501245, 'kl_divergence': -0.004450157441880931, 'dtw': -1.6827415461051487e-08, 'cross_correlation': -0.029640243496220187}"
